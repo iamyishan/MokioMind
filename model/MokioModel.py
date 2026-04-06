@@ -5,32 +5,32 @@ class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
-            self,
-            dropout: float = 0.0,
-            bos_token_id: int = 1,
-            eos_token_id: int = 2,
-            hidden_act: str = "silu",
-            hidden_size: int = 512,
-            intermediate_size: int = None,
-            max_position_embeddings: int = 32768,
-            num_attention_heads: int = 8,
-            num_hidden_layers: int = 8,
-            num_key_value_heads: int = 2,
-            vocab_size: int = 6400,
-            rms_norm_eps: float = 1e-05,
-            rope_theta: int = 1000000,
-            inference_rope_scaling: bool = False,
-            flash_attention: bool = True,
-            ############ MoE ############
-            use_moe: bool = False,
-            num_experts_per_tok: int = 2,
-            n_routed_experts: int = 4,
-            n_shared_experts: int = 1,
-            scoring_func: str = "softmax",
-            aux_loss_alpha: float = 0.01,
-            seq_aux: bool = True,
-            norm_topk_prob: bool = True,
-            **kwargs,
+        self,
+        dropout: float = 0.0,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        hidden_act: str = "silu",
+        hidden_size: int = 512,
+        intermediate_size: int = None,
+        max_position_embeddings: int = 32768,
+        num_attention_heads: int = 8,
+        num_hidden_layers: int = 8,
+        num_key_value_heads: int = 2,
+        vocab_size: int = 6400,
+        rms_norm_eps: float = 1e-05,
+        rope_theta: int = 1000000,
+        inference_rope_scaling: bool = False,
+        flash_attention: bool = True,
+        ############ MoE ############
+        use_moe: bool = False,
+        num_experts_per_tok: int = 2,
+        n_routed_experts: int = 4,
+        n_shared_experts: int = 1,
+        scoring_func: str = "softmax",
+        aux_loss_alpha: float = 0.01,
+        seq_aux: bool = True,
+        norm_topk_prob: bool = True,
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -84,47 +84,23 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        """
-        Args:
-            dim: 归一化的维度大小
-            eps: 防止除零的小常数
-        """
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        # nn.Parameter: 将tensor注册为可学习参数，会自动加入optimizer
-        # torch.ones(dim): 创建全1的tensor作为缩放参数
-        self.g = nn.Parameter(torch.ones(dim))  # γ伽马项
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        """
-        RMSNorm的核心计算：x / sqrt(mean(x^2) + eps)
-        """
-        # x.pow(2): 对x每个元素平方
-        # .mean(-1, keepdim=True): 在最后一维求均值，保持维度
-        # torch.rsqrt(): 计算平方根的倒数，即 1/sqrt(x)
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        """
-        前向传播
-        Args:
-            x: 输入tensor，shape为[batch, seq_len, dim]
-        Returns:
-            归一化后的tensor
-        """
-        # .float(): 转换为float32进行计算，提高数值稳定性
-        # .type_as(x): 将结果转换回x的原始数据类型
-        # self.g : 可学习的缩放参数
-        output = self._norm(x.float()).type_as(x)
-        return output * self.g
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 def precompute_freqs(
-        dim: int,
-        seq_len: int = int(32 * 1024),
-        rope_base: float = 1e6,
-        rope_scaling: Optional[dict] = None,
+    dim: int,
+    end: int = int(32 * 1024),
+    rope_base: float = 1e6,
+    rope_scaling: Optional[dict] = None,
 ):
     # 1. 初始化标准 RoPE 频率。
     # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
@@ -150,10 +126,10 @@ def precompute_freqs(
         )
 
         # 只有当要推断的长度大于原始训练长度时，才应用缩放
-        if seq_len / orig_max > 1.0:
+        if end / orig_max > 1.0:
             # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
-                    2 * math.log(rope_base)
+                2 * math.log(rope_base)
             )
 
             # 4. 计算高频区和低频区的维度切分点
@@ -178,43 +154,37 @@ def precompute_freqs(
             # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
             # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
             # ramp在0-1之间时：平滑过渡。
-            freqs = freqs * (1 - ramp + ramp / factor) #(dim//2,)
-        # 7. 根据目标长度 end，生成位置索引向量 t
-        t = torch.arange(seq_len, device=freqs.device)  # (seq_len,)
-        # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
-        freqs = torch.outer(t, freqs).float()  # (seq_len, dim//2)
-        # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
-        freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor  # 维度=[seq_len, dim]
-        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor  # 维度=[seq_len, dim]
+            freqs = freqs * (1 - ramp + ramp / factor)
 
-        return freqs_cos, freqs_sin
+    # 7. 根据目标长度 end，生成位置索引向量 t
+    t = torch.arange(end, device=freqs.device)
+
+    # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
+    freqs = torch.outer(t, freqs).float()
+
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+
+    return freqs_cos, freqs_sin
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    # [a,b]->[-b,a]
     def rotate_half(x):
-        """
-           将向量的前半部分和后半部分交换，并对后半部分取负
-           [x1, x2, x3, x4] -> [-x3, -x4, x1, x2]
-           这是实现旋转的关键辅助函数
-        """
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
 
-    # 旋转公式：
-    #     q' = q * cos + rotate_half(q) * sin
-    #     k' = k * cos + rotate_half(k) * sin
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
-            rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
     )
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
-            rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
 
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -224,58 +194,62 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
         .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
+
+
 class Attention(nn.Module):
     def __init__(self, args: MokioMindConfig):
         super().__init__()
-        # GQA (Grouped Query Attention) 配置
-        # 如果 num_key_value_heads 未指定，则使用 num_attention_heads（标准MHA）
-        # 否则使用更少的KV头（GQA），减少内存和计算量
+
         self.num_key_value_heads = (
             args.num_attention_heads
             if args.num_key_value_heads is None
             else args.num_key_value_heads
         )
-        # 确保 num_attention_heads 能被 num_key_value_heads 整除
-        # 例如：32个头，8个KV头，则每组4个查询头共享1个KV头
+
         assert args.num_attention_heads % self.num_key_value_heads == 0
 
-        self.n_local_heads = args.num_attention_heads  # 本地查询头数，如 32
-        self.n_local_kv_heads = args.num_key_value_heads  # 本地KV头数，如 8
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads  # 重复次数，如 4
-
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
-        self.q_proj=nn.Linear(args.hidden_size, args.num_attention_heads*self.head_dim,bias= False)
-        self.k_proj=nn.Linear(args.hidden_size, args.num_key_value_heads*self.head_dim,bias= False)
-        self.v_proj=nn.Linear(args.hidden_size, args.num_key_value_heads*self.head_dim,bias= False)
-        self.o_proj=nn.Linear(args.num_attention_heads*self.head_dim, args.hidden_size,bias= False)
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        self.dropout=nn.Dropout(args.dropout)
-        # 检查是否可用 PyTorch 原生 Flash Attention（更快、更省内存）
-        self.flash=(hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
     def forward(
         self,
-        x: torch.Tensor,  # 输入: (batch_size, seq_len, hidden_size)  例如 (2, 512, 4096)
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],# RoPE的cos和sin: (seq_len, head_dim)
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # 推理时，(cached_keys, cached_values)缓存之前计算的key和value,（batch_size, past_seq_len, n_kv_heads, head_dim)
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
-        attention_mask: Optional[torch.Tensor] = None, #(batch_size, seq_len)
-        ):
-        # 投影，计算q,k,v
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
         bsz, seq_len, _ = x.shape
-        # 重塑为多头格式：(bsz, seq_len, num_heads, head_dim)
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)  # (2, 512, 32, 128)
-        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim) # (2, 512, 8, 128)
-        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)  # (2, 512, 8, 128)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        # 应用 RoPE (Rotary Position Embedding) 旋转位置编码
-        # 只对 Q 和 K 应用，V 不需要
-        cos, sin = position_embeddings  # 各为 (seq_len, head_dim)
+        cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
-        # 输出维度不变: xq (2, 512, 32, 128), xk (2, 512, 8, 128)
 
         # kv_cache实现
         if past_key_value is not None:
@@ -283,16 +257,17 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
-        xq,xk,xv=(xq.transpose(1,2),
-                  # [batch_size,  n_local_heads,seq_len, head_dim]
-                 repeat_kv(xk, self.n_rep).transpose(1,2),
-                 repeat_kv(xv, self.n_rep).transpose(1,2)
-                  )
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+
         if (
-                self.flash
-                and (seq_len > 1)
-                and (past_key_value is None)
-                and (attention_mask is None or torch.all(attention_mask == 1))
+            self.flash
+            and (seq_len > 1)
+            and (past_key_value is None)
+            and (attention_mask is None or torch.all(attention_mask == 1))
         ):
             output = F.scaled_dot_product_attention(
                 xq,
@@ -307,17 +282,19 @@ class Attention(nn.Module):
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1,
             )
+
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
+
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
+
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
-
 
 
 class FeedForward(nn.Module):
@@ -342,6 +319,8 @@ class FeedForward(nn.Module):
     def forward(self, x):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
+
+
 class MoEGate(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
@@ -551,6 +530,7 @@ class MokioMindBlock(nn.Module):
         )
         return hidden_states, present_key_value
 
+
 class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
@@ -632,7 +612,6 @@ class MokioMindModel(nn.Module):
         )
 
         return hidden_states, presents, aux_loss
-
 
 
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):

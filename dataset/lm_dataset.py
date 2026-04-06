@@ -79,6 +79,11 @@ class PretrainDataset(Dataset):
         self.max_length = max_length
         # 使用 HuggingFace datasets 的惰性加载，避免一次性读入大文件
         self.samples = load_dataset("json", data_files=data_path, split="train")
+        
+        # 📊 打印数据集信息
+        print(f"📊 数据集加载完成:")
+        print(f"   - 样本数量 (len(samples)): {len(self.samples)}")
+        print(f"   - 数据路径: {data_path}")
 
     def __len__(self):
         return len(self.samples)
@@ -111,3 +116,44 @@ class PretrainDataset(Dataset):
         # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         return input_ids, labels, attention_mask
+
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+
+    # 获取当前文件所在目录的父目录（项目根目录）
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    tokenizer_path = os.path.join(project_root, "model")
+    data_path = os.path.join(current_dir,"pretrain_t2t_mini.jsonl")
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # 如果 tokenizer 没有 pad_token，则设置为 eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    print(f"pad_token: {tokenizer.pad_token}")
+    
+    # 创建数据集实例，使用相对于项目根目录的数据集路径
+    dataset = PretrainDataset(
+        data_path=data_path, 
+        tokenizer=tokenizer, 
+        max_length=512
+    )
+    
+    print(f"数据集大小：{len(dataset)}")
+    
+    # 测试获取第一个样本
+    input_ids, labels, attention_mask = dataset[0]
+    
+    print(f"Input IDs shape: {input_ids.shape}")
+    print(f"Labels shape: {labels.shape}")
+    print(f"Attention mask shape: {attention_mask.shape}")
+    
+    # 解码查看实际内容
+    decoded_text = tokenizer.decode(input_ids.tolist(), skip_special_tokens=False)
+    print(f"解码后的文本：{decoded_text}")
+    
+    # 查看非 padding 部分的实际 token 数量
+    actual_tokens_count = attention_mask.sum().item()
+    print(f"实际 token 数量：{actual_tokens_count}")
