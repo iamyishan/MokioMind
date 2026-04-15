@@ -174,7 +174,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_moe",
-        default=0,
+        default=1,
         type=int,
         choices=[0, 1],
         help="是否使用MoE架构（0=否，1=是）",
